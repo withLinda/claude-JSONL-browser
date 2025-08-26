@@ -614,7 +614,7 @@ export default function JsonlConverter() {
             <div className="p-4 text-center text-everforest-grey1 text-sm">
               No files uploaded yet.
               <br />
-              Drag & drop JSONL files here or click "Add Files"
+              Drag & drop JSONL files here or click &ldquo;Add Files&rdquo;
             </div>
           ) : (
             getSortedFiles().map(file => {
