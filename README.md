@@ -28,6 +28,8 @@ Claude Code CLI automatically saves all your conversations in JSONL format at `~
 3. Drag & drop or upload your `.jsonl` files
 4. View, search, and export your conversations
 
+![Claude Code JSONL Viewer Interface](Readme-images/Claude-Code-CLI-JSONL-viewer-converter-to-Markdown.png)
+
 ### Running Locally
 
 ```bash
