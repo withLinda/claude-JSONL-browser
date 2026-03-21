@@ -1,10 +1,10 @@
 'use client'
 
 import React, { useState, useEffect, useRef } from 'react'
-import { 
-  FileText, Copy, CheckCircle, Upload, Download, X, 
+import {
+  FileText, Copy, CheckCircle, Upload, Download, X,
   Search, ChevronRight, ChevronDown, Menu, File,
-  FolderOpen, Trash2, FileCheck, AlertCircle, Edit2,
+  FolderOpen, FolderPlus, Trash2, AlertCircle, Edit2,
   ArrowUpDown, Calendar, Type, HardDrive, Check
 } from 'lucide-react'
 import { 
@@ -58,6 +58,55 @@ interface SearchResult {
   }>
 }
 
+interface FolderEntry {
+  id: string
+  name: string
+  addedAt: number
+}
+
+const FOLDERS_STORAGE_KEY = 'jsonl-browser-folders'
+const DB_NAME = 'jsonl-browser'
+const DB_STORE = 'folder-handles'
+
+function openHandlesDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1)
+    req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function saveFolderHandle(id: string, handle: FileSystemDirectoryHandle): Promise<void> {
+  const db = await openHandlesDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite')
+    tx.objectStore(DB_STORE).put(handle, id)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+async function getFolderHandle(id: string): Promise<FileSystemDirectoryHandle | null> {
+  const db = await openHandlesDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readonly')
+    const req = tx.objectStore(DB_STORE).get(id)
+    req.onsuccess = () => resolve(req.result ?? null)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function removeFolderHandle(id: string): Promise<void> {
+  const db = await openHandlesDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite')
+    tx.objectStore(DB_STORE).delete(id)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
 export default function JsonlConverter() {
   const [files, setFiles] = useState<FileData[]>([])
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null)
@@ -69,12 +118,13 @@ export default function JsonlConverter() {
   const [isMobile, setIsMobile] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [searchResults, setSearchResults] = useState<Record<string, SearchResult>>({})
-  const [convertAllProgress, setConvertAllProgress] = useState<number | null>(null)
-  
   const [sortOrder, setSortOrder] = useState<string>('date-desc')
   const [editingFileId, setEditingFileId] = useState<string | null>(null)
   const [editingFileName, setEditingFileName] = useState('')
   const [sortDropdownOpen, setSortDropdownOpen] = useState(false)
+  const [jsonlExpanded, setJsonlExpanded] = useState(false)
+  const [folders, setFolders] = useState<FolderEntry[]>([])
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null)
   const editInputRef = useRef<HTMLInputElement>(null)
 
   // Detect screen size
@@ -90,6 +140,16 @@ export default function JsonlConverter() {
     checkScreenSize()
     window.addEventListener('resize', checkScreenSize)
     return () => window.removeEventListener('resize', checkScreenSize)
+  }, [])
+
+  // Load persisted folders from localStorage on mount
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(FOLDERS_STORAGE_KEY) || '[]')
+      setFolders(stored)
+    } catch {
+      // ignore malformed storage
+    }
   }, [])
 
   // Focus input when editing starts
@@ -392,8 +452,104 @@ export default function JsonlConverter() {
     }
   }
 
+  const loadFilesFromFolderHandle = async (handle: FileSystemDirectoryHandle) => {
+    setFiles([])
+    setSelectedFileId(null)
+    const newFiles: FileData[] = []
+
+    for await (const [name, entry] of (handle as any).entries()) {
+      if (entry.kind === 'file' && (name.endsWith('.jsonl') || name.endsWith('.json'))) {
+        const file = await (entry as FileSystemFileHandle).getFile()
+        const content = await file.text()
+        let markdown: string | null = null
+        let converted = false
+        try {
+          markdown = convertJsonlToMarkdown(content)
+          converted = true
+        } catch {
+          // conversion failed; will show raw content
+        }
+        newFiles.push({
+          id: generateFileId(),
+          name,
+          content,
+          markdown,
+          lastModified: file.lastModified,
+          size: file.size,
+          converted
+        })
+      }
+    }
+
+    setFiles(newFiles)
+    if (newFiles.length > 0) setSelectedFileId(newFiles[0].id)
+  }
+
+  const handleAddFolder = async () => {
+    if (!('showDirectoryPicker' in window)) {
+      setError('Your browser does not support folder selection')
+      return
+    }
+    try {
+      const handle = await (window as any).showDirectoryPicker({ mode: 'read' })
+      const id = generateFileId()
+      const entry: FolderEntry = { id, name: handle.name, addedAt: Date.now() }
+      await saveFolderHandle(id, handle)
+      const newFolders = [...folders, entry]
+      setFolders(newFolders)
+      localStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(newFolders))
+      setSelectedFolderId(id)
+      await loadFilesFromFolderHandle(handle)
+    } catch (e: any) {
+      if (e.name !== 'AbortError') setError('Failed to open folder: ' + e.message)
+    }
+  }
+
+  const handleSelectFolder = async (id: string) => {
+    setSelectedFolderId(id)
+    try {
+      const handle = await getFolderHandle(id)
+      if (!handle) {
+        setError('Folder handle not found. Please re-add the folder.')
+        return
+      }
+      const perm = await (handle as any).queryPermission({ mode: 'read' })
+      if (perm !== 'granted') {
+        const newPerm = await (handle as any).requestPermission({ mode: 'read' })
+        if (newPerm !== 'granted') {
+          setError('Permission denied for this folder')
+          return
+        }
+      }
+      await loadFilesFromFolderHandle(handle)
+    } catch (e: any) {
+      setError('Failed to load folder: ' + e.message)
+    }
+  }
+
+  const handleRemoveFolder = async (id: string) => {
+    await removeFolderHandle(id)
+    const newFolders = folders.filter(f => f.id !== id)
+    setFolders(newFolders)
+    localStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(newFolders))
+    if (selectedFolderId === id) {
+      setSelectedFolderId(null)
+      setFiles([])
+      setSelectedFileId(null)
+    }
+  }
+
   const handleFileSelect = (fileId: string) => {
     setSelectedFileId(fileId)
+    const file = files.find(f => f.id === fileId)
+    if (file && !file.converted) {
+      try {
+        const markdown = convertJsonlToMarkdown(file.content)
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, markdown, converted: true } : f))
+      } catch (e: any) {
+        setError(e.message)
+      }
+    }
     if (isMobile) {
       setSidebarOpen(false)
     }
@@ -406,16 +562,25 @@ export default function JsonlConverter() {
       if (file.name.endsWith('.jsonl') || file.name.endsWith('.json')) {
         const reader = new FileReader()
         reader.onload = (event) => {
+          const content = event.target?.result as string
+          let markdown: string | null = null
+          let converted = false
+          try {
+            markdown = convertJsonlToMarkdown(content)
+            converted = true
+          } catch (e) {
+            // conversion failed; user can retry manually
+          }
           const fileObj: FileData = {
             id: generateFileId(),
             name: file.name,
-            content: event.target?.result as string,
-            markdown: null,
+            content,
+            markdown,
             lastModified: file.lastModified,
             size: file.size,
-            converted: false
+            converted
           }
-          
+
           setFiles(prev => [...prev, fileObj])
           
           if (!selectedFileId && newFiles.length === 0) {
@@ -451,48 +616,6 @@ export default function JsonlConverter() {
     e.preventDefault()
     e.stopPropagation()
     setIsDragging(false)
-  }
-
-  const convertCurrentFile = () => {
-    const currentFile = files.find(f => f.id === selectedFileId)
-    if (!currentFile) {
-      setError('No file selected')
-      return
-    }
-
-    try {
-      const markdown = convertJsonlToMarkdown(currentFile.content)
-      setFiles(prev => prev.map(f => 
-        f.id === selectedFileId 
-          ? { ...f, markdown, converted: true }
-          : f
-      ))
-      setError('')
-    } catch (e: any) {
-      setError(e.message)
-    }
-  }
-
-  const convertAllFiles = async () => {
-    setConvertAllProgress(0)
-    const totalFiles = files.length
-    let converted = 0
-
-    const updatedFiles: FileData[] = []
-    
-    for (const file of files) {
-      try {
-        const markdown = convertJsonlToMarkdown(file.content)
-        updatedFiles.push({ ...file, markdown, converted: true })
-      } catch (e: any) {
-        updatedFiles.push({ ...file, error: e.message })
-      }
-      converted++
-      setConvertAllProgress(Math.round((converted / totalFiles) * 100))
-    }
-    
-    setFiles(updatedFiles)
-    setTimeout(() => setConvertAllProgress(null), 1000)
   }
 
   const deleteFile = (fileId: string) => {
@@ -557,6 +680,14 @@ export default function JsonlConverter() {
 
   return (
     <div className="h-screen bg-everforest-bg0 flex overflow-hidden">
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept=".jsonl,.json"
+        onChange={(e) => e.target.files && handleFilesUpload(e.target.files)}
+        className="hidden"
+      />
       {/* Sidebar */}
       <div className={cn(
         "w-full sm:w-[280px] sm:min-w-[280px] bg-everforest-bg-dim",
@@ -564,22 +695,74 @@ export default function JsonlConverter() {
         "absolute sm:relative h-screen transition-all duration-300 z-50 sm:z-0",
         sidebarOpen ? "left-0" : "-left-full sm:-left-[280px]"
       )}>
+        {/* Folders Section */}
         <div className="p-4 border-b border-everforest-bg4">
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
-              <FolderOpen className="w-5 h-5 text-everforest-green" />
-              <h3 className="text-base font-medium text-everforest-fg">
-                Files ({files.length})
-              </h3>
+              <FolderOpen className="w-4 h-4 text-everforest-aqua" />
+              <h3 className="text-sm font-medium text-everforest-fg">Folders</h3>
             </div>
-            {isMobile && (
+            <div className="flex items-center gap-1">
               <button
-                onClick={() => setSidebarOpen(false)}
-                className="p-1 hover:bg-everforest-bg1 rounded transition-colors"
+                onClick={handleAddFolder}
+                title="Add folder"
+                className="p-1 hover:bg-everforest-bg2 rounded transition-colors"
               >
-                <X className="w-5 h-5 text-everforest-grey1" />
+                <FolderPlus className="w-4 h-4 text-everforest-aqua" />
               </button>
-            )}
+              {isMobile && (
+                <button
+                  onClick={() => setSidebarOpen(false)}
+                  className="p-1 hover:bg-everforest-bg1 rounded transition-colors"
+                >
+                  <X className="w-4 h-4 text-everforest-grey1" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {folders.length === 0 ? (
+            <p className="text-xs text-everforest-grey1 py-1">
+              No folders added yet — click <FolderPlus className="inline w-3 h-3" /> to add one
+            </p>
+          ) : (
+            <div className="space-y-0.5 max-h-36 overflow-y-auto custom-scrollbar">
+              {folders.map(folder => (
+                <div
+                  key={folder.id}
+                  onClick={() => handleSelectFolder(folder.id)}
+                  className={cn(
+                    "flex items-center justify-between px-2 py-1.5 rounded cursor-pointer transition-colors group",
+                    selectedFolderId === folder.id
+                      ? "bg-everforest-bg2 text-everforest-aqua"
+                      : "text-everforest-fg hover:bg-everforest-bg1"
+                  )}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <FolderOpen className={cn(
+                      "w-3.5 h-3.5 flex-shrink-0",
+                      selectedFolderId === folder.id ? "text-everforest-aqua" : "text-everforest-grey1"
+                    )} />
+                    <span className="text-xs truncate">{folder.name}</span>
+                  </div>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleRemoveFolder(folder.id) }}
+                    className="p-0.5 opacity-0 group-hover:opacity-60 hover:!opacity-100 hover:text-everforest-red rounded transition-all"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Files Section */}
+        <div className="p-4 border-b border-everforest-bg4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-medium text-everforest-fg">
+              Files ({files.length})
+            </h3>
           </div>
 
           {/* Search Bar */}
@@ -645,29 +828,6 @@ export default function JsonlConverter() {
               <Upload className="w-3.5 h-3.5" />
               Add Files
             </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept=".jsonl,.json"
-              onChange={(e) => e.target.files && handleFilesUpload(e.target.files)}
-              className="hidden"
-            />
-            {files.length > 1 && (
-              <button
-                onClick={convertAllFiles}
-                className="flex-1 px-3 py-2 bg-everforest-bg-green text-everforest-green border border-everforest-green/30 rounded-md text-xs flex items-center justify-center gap-1 hover:bg-everforest-bg-green/80 transition-colors"
-              >
-                {convertAllProgress !== null ? (
-                  `${convertAllProgress}%`
-                ) : (
-                  <>
-                    <FileCheck className="w-3.5 h-3.5" />
-                    Convert All
-                  </>
-                )}
-              </button>
-            )}
           </div>
 
           {files.some(f => f.converted) && (
@@ -893,49 +1053,43 @@ export default function JsonlConverter() {
               </button>
             </div>
           ) : (
-            <div className="flex flex-col lg:flex-row gap-6 h-full overflow-hidden">
-              {/* Input Section */}
-              <div className="flex-1 flex flex-col min-h-0">
-                <div className="flex justify-between items-center mb-4">
-                  <h3 className="text-base text-everforest-fg">
-                    JSONL Content - {currentFile.name}
-                  </h3>
-                </div>
-                
-                <textarea
-                  value={currentFile.content}
-                  onChange={(e) => {
-                    const newContent = e.target.value
-                    setFiles(prev => prev.map(f =>
-                      f.id === currentFile.id
-                        ? { ...f, content: newContent, converted: false }
-                        : f
-                    ))
-                  }}
-                  className="w-full flex-1 min-h-[200px] p-4 bg-everforest-bg2 border border-everforest-bg4 rounded-lg font-mono text-sm text-everforest-fg outline-none resize-none custom-scrollbar focus:border-everforest-green transition-colors"
-                />
-
+            <div className="flex flex-col gap-4 h-full overflow-hidden">
+              {/* JSONL Source - collapsible */}
+              <div className="flex-shrink-0">
                 <button
-                  onClick={convertCurrentFile}
-                  className="mt-4 w-full py-3 bg-everforest-green text-everforest-bg0 rounded-lg text-base font-medium hover:bg-everforest-green/90 transition-colors"
+                  onClick={() => setJsonlExpanded(prev => !prev)}
+                  className="flex items-center gap-2 text-sm text-everforest-grey1 hover:text-everforest-fg transition-colors"
                 >
-                  Convert to Markdown
+                  {jsonlExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  JSONL Source
                 </button>
 
-                {error && (
-                  <div className="mt-4 p-3 bg-everforest-bg-red border border-everforest-red/30 rounded-md text-everforest-red text-sm flex items-center gap-2">
-                    <AlertCircle className="w-4 h-4" />
-                    {error}
+                {jsonlExpanded && (
+                  <div className="mt-2 flex flex-col gap-2">
+                    <textarea
+                      value={currentFile.content}
+                      onChange={(e) => {
+                        const newContent = e.target.value
+                        setFiles(prev => prev.map(f =>
+                          f.id === currentFile.id
+                            ? { ...f, content: newContent, converted: false }
+                            : f
+                        ))
+                      }}
+                      className="w-full h-48 p-4 bg-everforest-bg2 border border-everforest-bg4 rounded-lg font-mono text-sm text-everforest-fg outline-none resize-none custom-scrollbar focus:border-everforest-green transition-colors"
+                    />
+                    {error && (
+                      <div className="p-3 bg-everforest-bg-red border border-everforest-red/30 rounded-md text-everforest-red text-sm flex items-center gap-2">
+                        <AlertCircle className="w-4 h-4" />
+                        {error}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* Output Section */}
+              {/* Markdown Output - primary */}
               <div className="flex-1 flex flex-col min-h-0">
-                <h3 className="text-base text-everforest-fg mb-4">
-                  Markdown Output
-                </h3>
-                
                 <div className="w-full flex-1 min-h-[200px] p-4 bg-everforest-bg2 border border-everforest-bg4 rounded-lg overflow-auto custom-scrollbar">
                   {currentFile.markdown ? (
                     <pre className="whitespace-pre-wrap break-words font-mono text-sm text-everforest-fg">
